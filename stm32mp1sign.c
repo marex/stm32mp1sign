@@ -24,6 +24,7 @@
 #include <libgen.h>
 
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <fcntl.h>
 
 /* Usage of deprecated functions.
@@ -51,7 +52,7 @@
 /* The CPU hashes header from offset 0x48,
  * ie. from member header_version and all of the data.
  */
-#define STM32_HASH_OFFSET               offsetof(struct stm32_header, header_version)
+#define STM32_HASH_OFFSET               offsetof(struct stm32_header_v1, header_version)
 
 /* The stm32 header is often defined to be 0x100 bytes.
  * However, some implementations carry a padding of
@@ -60,7 +61,10 @@
  * Also add packed, which seems to be missing in
  * a lot of implementations in the wild.
  */
-struct __attribute((packed)) stm32_header {
+
+static uint8_t hashes[8 * 32] = { 0 };
+
+struct __attribute((packed)) stm32_header_v1 {
         uint32_t magic_number;
         uint8_t image_signature[64];
         uint32_t image_checksum;
@@ -71,6 +75,8 @@ struct __attribute((packed)) stm32_header {
         uint32_t load_address;
         uint32_t reserved2;
         uint32_t version_number;
+
+        /* V1.0 specific content */
         uint32_t option_flags;
         uint32_t ecdsa_algorithm;
         uint8_t ecdsa_public_key[64];
@@ -78,12 +84,43 @@ struct __attribute((packed)) stm32_header {
         uint8_t binary_type;
 };
 
+struct __attribute((packed)) stm32_header_v2 {
+        uint32_t magic_number;
+        uint8_t image_signature[64];
+        uint32_t image_checksum;
+        uint8_t  header_version[4];
+        uint32_t image_length;
+        uint32_t image_entry_point;
+        uint32_t reserved1;
+        uint32_t load_address;
+        uint32_t reserved2;
+        uint32_t version_number;
+
+        /* V2.0 specific content */
+        uint32_t extension_flags;
+        uint32_t extension_headers_length;
+        uint32_t binary_type;
+        uint8_t padding[16];
+
+        uint32_t extension_header_type;
+        uint32_t extension_header_length;
+        uint32_t public_key_index;
+        uint32_t public_key_count;
+        uint32_t public_key_algo;
+        uint8_t ecdsa_public_key[64];
+        uint8_t ecdsa_public_key_hash[8 * 32];
+
+        uint32_t extension_header_type1;
+        uint32_t extension_header_length1;
+        uint8_t extension_padding[36];
+};
+
 static void
 usage(char *argv[])
 {
         printf("%s usage:\n", argv[0]);
         printf("---------------------\n");
-        printf("%s --image <file> --key <file> --sign [--password <string>]\n", argv[0]);
+        printf("%s --image <file> --key <file> --sign [--password <string>] [--hashes pkh01.bin:..:pkh07.bin]\n", argv[0]);
         printf("%s --image <file> --key <file> --verify\n", argv[0]);
         printf("%s --help\n", argv[0]);
         printf("where:\n");
@@ -98,14 +135,18 @@ usage(char *argv[])
         printf("              ; If not used, program will ask interactively.\n");
         printf("--pubhash     ; Not mandatory. If used then the raw ec point hash of the public key\n");
         printf("              ; will be overwritten to the current dir + pubkey.hash filename.\n");
+        printf("--hashes      ; Mandatory for STM32MP2 image, list of publicKeyHash0*.bin separate by colon.\n");
         printf("--version     ; %s version.\n", argv[0]);
         printf("--help        ; This help.\n");
 }
 
 static unsigned char *
-stm32image_load(int fd, off_t *len)
+stm32image_load(int fd, off_t *len, bool v2)
 {
+        off_t hlen = v2 ? sizeof(struct stm32_header_v2) : sizeof(struct stm32_header_v1);
+        unsigned char padbytes[32] = { 0 };
         unsigned char *data;
+        ssize_t ret, pad = 0;
 
         if (fd < 0 || !len) {
                 fprintf(stderr, "Invalid input.\n");
@@ -116,10 +157,23 @@ stm32image_load(int fd, off_t *len)
                 fprintf(stderr, "Cannot seek to end.\n");
                 goto err_out;
         }
-        if (*len <= (off_t)sizeof(struct stm32_header)) {
+
+        if (*len <= hlen) {
                 fprintf(stderr, "Image file too small for stm32 header.\n");
                 goto err_out;
         }
+
+        if (v2 && (*len % 32)) {
+                /* Image v2 must be padded to 32 Bytes */
+                pad = 32 - (*len % 32);
+                ret = write(fd, padbytes, pad);
+                if (ret != pad) {
+                        fprintf(stderr, "Image file padding to 32 Bytes failed.\n");
+                        goto err_out;
+                }
+                *len += pad;
+        }
+
         if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
                 fprintf(stderr, "Cannot seek to start.\n");
                 goto err_out;
@@ -276,18 +330,57 @@ openssl_get_pubkey(EC_KEY *eckey, size_t *len, int *alg)
 }
 
 static ECDSA_SIG *
-openssl_do_ecdsa_sha256_sign(EC_KEY *eckey,
+openssl_do_ecdsa_sha256_sign(EC_KEY *eckey, bool v2,
                              unsigned char *data, unsigned long datalen)
 {
+        unsigned char md[SHA256_DIGEST_LENGTH];
         ECDSA_SIG *ecsig = NULL;
+        SHA256_CTX c;
+        int ret;
 
         if (!eckey || !data || !datalen) {
                 fprintf(stderr, "Invalid input.\n");
                 goto err_out;
         }
 
-        if (!(ecsig = ECDSA_do_sign(SHA256(data, datalen, NULL),
-                                    SHA256_DIGEST_LENGTH, eckey))) {
+        ret = SHA256_Init(&c);
+        if (!ret) {
+                fprintf(stderr, "Failed to initialize SHA256.\n");
+                goto err_out;
+        }
+
+        if (v2) {
+                /*
+                 * Handle special hole in v2 image base header, see
+                 * comment below regarding ST wiki explains this in
+                 * https://wiki.st.com/stm32mpu/wiki/STM32_header_for_binary_files#On_STM32MP23x_lines_and_STM32MP25x_lines
+                 */
+                ret = SHA256_Update(&c, data, 0x30);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 base header.\n");
+                        goto err_out;
+                }
+
+                ret = SHA256_Update(&c, data + 0x38, datalen - 0x30);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 rest.\n");
+                        goto err_out;
+                }
+        } else {
+                ret = SHA256_Update(&c, data, datalen);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 data.\n");
+                        goto err_out;
+                }
+        }
+
+        ret = SHA256_Final(md, &c);
+        if (!ret) {
+                fprintf(stderr, "Failed to finalize SHA256.\n");
+                goto err_out;
+        }
+
+        if (!(ecsig = ECDSA_do_sign(md, SHA256_DIGEST_LENGTH, eckey))) {
                 fprintf(stderr, "Unable to generate ECDSA signature.\n");
                 goto err_out;
         }
@@ -299,16 +392,56 @@ openssl_do_ecdsa_sha256_sign(EC_KEY *eckey,
 }
 
 static ECDSA_SIG *
-openssl_do_ecdsa_sha256_verify(ECDSA_SIG *ecsig, EC_KEY *eckey,
+openssl_do_ecdsa_sha256_verify(ECDSA_SIG *ecsig, EC_KEY *eckey, bool v2,
                                unsigned char *data, unsigned long datalen)
 {
+        unsigned char md[SHA256_DIGEST_LENGTH];
+        SHA256_CTX c;
+        int ret;
+
         if (!ecsig || !eckey || !data || !datalen) {
                 fprintf(stderr, "Invalid input.\n");
                 goto err_out;
         }
 
-        if (!(ECDSA_do_verify(SHA256(data, datalen, NULL),
-                              SHA256_DIGEST_LENGTH, ecsig, eckey))) {
+        ret = SHA256_Init(&c);
+        if (!ret) {
+                fprintf(stderr, "Failed to initialize SHA256.\n");
+                goto err_out;
+        }
+
+        if (v2) {
+                /*
+                 * Handle special hole in v2 image base header, see
+                 * comment below regarding ST wiki explains this in
+                 * https://wiki.st.com/stm32mpu/wiki/STM32_header_for_binary_files#On_STM32MP23x_lines_and_STM32MP25x_lines
+                 */
+                ret = SHA256_Update(&c, data, 0x30);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 base header.\n");
+                        goto err_out;
+                }
+
+                ret = SHA256_Update(&c, data + 0x38, datalen - 0x30);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 rest.\n");
+                        goto err_out;
+                }
+        } else {
+                ret = SHA256_Update(&c, data, datalen);
+                if (!ret) {
+                        fprintf(stderr, "Failed to SHA256 data.\n");
+                        goto err_out;
+                }
+        }
+
+        ret = SHA256_Final(md, &c);
+        if (!ret) {
+                fprintf(stderr, "Failed to finalize SHA256.\n");
+                goto err_out;
+        }
+
+        if (!(ECDSA_do_verify(md, SHA256_DIGEST_LENGTH, ecsig, eckey))) {
                 fprintf(stderr, "Unable to verify ECDSA signature.\n");
                 goto err_out;
         }
@@ -322,7 +455,8 @@ openssl_do_ecdsa_sha256_verify(ECDSA_SIG *ecsig, EC_KEY *eckey,
 int
 main(int argc, char *argv[])
 {
-        struct stm32_header *h = NULL;
+        struct stm32_header_v1 *h = NULL;
+        struct stm32_header_v2 *h2 = NULL;
         FILE *fp = NULL;
         unsigned char *p;
         char *key_path = NULL;
@@ -330,11 +464,13 @@ main(int argc, char *argv[])
         EC_KEY *eckey = NULL;
         ECDSA_SIG *ecsig = NULL;
         unsigned char *data = NULL;
-        off_t datalen;
+        off_t datalen, signlen;
         uint8_t *buf = NULL;
         size_t len;
         int alg, c, fd = -1;
         bool sign = false, verify = false, pubhash = false;
+        int tokfd, tokc = 0;
+        int v2 = 0;
 
         static struct option options[] = {
                 {"image", required_argument, 0, 'i'},
@@ -343,6 +479,7 @@ main(int argc, char *argv[])
                 {"verify", no_argument, 0, 'v'},
                 {"password", required_argument, 0, 'p'},
                 {"pubhash", no_argument, 0, 'x'},
+                {"hashes", required_argument, 0, 'H'},
                 {"version", no_argument, 0, 'V'},
                 {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
@@ -384,6 +521,29 @@ main(int argc, char *argv[])
                 case 'x':
                         pubhash = true;
                         break;
+                case 'H':
+                        for (char *tok = strtok(strdup(optarg), ":"); tok != NULL; tok = strtok(NULL, ":")) {
+                                tokfd = open(tok, O_RDONLY);
+                                if (!tokfd) {
+                                        fprintf(stderr,
+                                                "Error: Cannot open %s: %s\n",
+                                                tok, strerror(errno));
+                                        usage(argv);
+                                        goto err_out;
+                                }
+                                int ret = read(tokfd, &(hashes[tokc]), 32);
+                                if (ret != 32) {
+                                        fprintf(stderr,
+                                                "Error: Cannot read %s: %s\n",
+                                                tok, strerror(errno));
+                                        usage(argv);
+                                        goto err_out;
+                                }
+                                tokc += 32;
+                                close(tokfd);
+                        }
+                        v2 = 1;
+                        break;
                 case 'V':
                         fprintf(stderr, "Version: %s\n", PACKAGE_VERSION);
                         goto err_out;
@@ -422,9 +582,10 @@ main(int argc, char *argv[])
         }
 
         /* Load and validate image magic. */
-        if (!(data = stm32image_load(fd, &datalen))) {
+        if (!(data = stm32image_load(fd, &datalen, v2))) {
                 goto err_out;
         }
+
         /* Load key.
          * Contains both priv and pubkey if signing.
          * Contains only pubkey if verifying.
@@ -435,7 +596,34 @@ main(int argc, char *argv[])
         /* Slap the header over the data so we can modify it.
          * Don't forget header endians.
          */
-        h = (struct stm32_header *)data;
+        h = (struct stm32_header_v1 *)data;
+
+        /*
+         * When verifying the signature, read out the image version out
+         * of the image, instead of depending on supplied public key count.
+         */
+        if (verify && (h->header_version[1] == 2))
+                v2 = 1;
+
+        /*
+         * The ST wiki explains this in
+         * https://wiki.st.com/stm32mpu/wiki/STM32_header_for_binary_files#On_STM32MP23x_lines_and_STM32MP25x_lines
+         * "
+         * Signature is calculated from first byte of header
+         * version field to last byte of image given by image
+         * length field, excluding the last bytes following
+         * the padding field.
+         * "
+         * The "... excluding the last bytes ..." part means
+         * these 8 bytes, which are 8 out of 16 bytes of the
+         * "Reserved padding bytes" at the end of base header.
+         * Why is this done in such a complicated manner is
+         * unclear.
+         */
+        signlen = datalen;
+        if (v2)
+                signlen -= 8;
+
         /* sign and verify already checked to be mutually exclusive */
         if (sign) {
                 /* Get raw pubkey from key. */
@@ -451,24 +639,59 @@ main(int argc, char *argv[])
                  * First byte is the type declaration. Skip it.
                  * Raw bignum. Two points on curve. X concatenated with Y.
                  */
-                memcpy(h->ecdsa_public_key, &buf[1], len - 1);
-                /* option:
-                 * 0: signed.
-                 * 1: not signed.
-                 */
-                h->option_flags = htole32(0);
-                /* Algorithm:
-                 * 1: prime256v1
-                 * 2: brainpoolP256r1
-                 */
-                h->ecdsa_algorithm = htole32(alg);
-                /* Do ECDSA signature with sha256
-                 * from correct offset in header to end of data.
-                 */
+                if (v2) {
+                        h2 = (struct stm32_header_v2 *)data;
+
+                        h2->image_length = datalen - sizeof(struct stm32_header_v2);
+
+                        memcpy(h2->ecdsa_public_key, &buf[1], len - 1);
+                        memcpy(h2->ecdsa_public_key_hash, hashes, 32 * 8);
+
+                        h2->extension_flags = 0x80000001;
+                        h2->extension_headers_length = 0x180;
+                        h2->binary_type = 0x10;
+
+                        h2->extension_header_type = htobe32(0x53540002);
+                        h2->extension_header_length = 0x154;
+                        h2->public_key_index = 0; /* Should be configurable */
+                        h2->public_key_count = 8;
+                        /* Algorithm:
+                         * 1: prime256v1
+                         * 2: brainpoolP256r1
+                         */
+                        h2->public_key_algo = htole32(alg);
+
+                        uint8_t extension_padding[36] = { 0 };
+                        ssize_t rnd = getrandom(extension_padding, sizeof(extension_padding), 0);
+                        if (rnd != sizeof(extension_padding)) {
+                                fprintf(stderr, "Unable to generate random padding.\n");
+                                goto err_out;
+                        }
+
+                        h2->extension_header_type1 = htobe32(0x5354ffff);
+                        h2->extension_header_length1 = 0x2c;
+                        memcpy(h2->extension_padding, extension_padding, 36);
+                } else {
+                        h->image_length = datalen - sizeof(struct stm32_header_v1);
+
+                        /* option:
+                         * 0: signed.
+                         * 1: not signed.
+                         */
+                        h->option_flags = htole32(1);
+                        /* Algorithm:
+                         * 1: prime256v1
+                         * 2: brainpoolP256r1
+                         */
+                        h->ecdsa_algorithm = htole32(alg);
+                        /* Do ECDSA signature with sha256
+                         * from correct offset in header to end of data.
+                         */
+                }
                 if (!(ecsig =
-                      openssl_do_ecdsa_sha256_sign(eckey,
+                      openssl_do_ecdsa_sha256_sign(eckey, v2,
                                                    &data[STM32_HASH_OFFSET],
-                                                   datalen - STM32_HASH_OFFSET))) {
+                                                   signlen - STM32_HASH_OFFSET))) {
                         goto err_out;
                 }
                 /* Copy signature to header.
@@ -494,9 +717,9 @@ main(int argc, char *argv[])
                  * from correct offset in header to end of data.
                  */
                 if (!(ecsig =
-                      openssl_do_ecdsa_sha256_verify(ecsig, eckey,
+                      openssl_do_ecdsa_sha256_verify(ecsig, eckey, v2,
                                                      &data[STM32_HASH_OFFSET],
-                                                     datalen - STM32_HASH_OFFSET))) {
+                                                     signlen - STM32_HASH_OFFSET))) {
                         goto err_out;
                 }
         }
